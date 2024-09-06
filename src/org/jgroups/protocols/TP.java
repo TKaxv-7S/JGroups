@@ -456,8 +456,9 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
     protected TP() {
     }
 
-    public MsgStats getMessageStats() {return msg_stats;}
-    public RTT      getRTT()          {return rtt;}
+    public MsgStats                getMessageStats()     {return msg_stats;}
+    public MessageProcessingPolicy msgProcessingPolicy() {return msg_processing_policy;}
+    public RTT                     getRTT()              {return rtt;}
 
     @Override
     public void enableStats(boolean flag) {
@@ -1075,15 +1076,21 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
 
         // Don't send if dest is local address. Instead, send it up the stack. If multicast message, loop back directly
         // to us (but still multicast). Once we receive this, we discard our own multicast message
-        boolean multicast=dest == null, do_send=multicast || !dest.equals(sender),
+        boolean multicast=dest == null,
           loop_back=(multicast || dest.equals(sender)) && !msg.isFlagSet(Message.TransientFlag.DONT_LOOPBACK);
 
-        if(dest instanceof PhysicalAddress && dest.equals(local_physical_addr)) {
+        if(dest instanceof PhysicalAddress && dest.equals(local_physical_addr))
             loop_back=true;
-            do_send=false;
+
+        if(loop_back && !loopback_separate_thread) {
+            final Message copy=loopback_copy? msg.copy(true, true) : msg;
+            if(is_trace)
+                log.trace("%s: looping back message %s, headers are %s", local_addr, copy, copy.printHeaders());
+            msg_stats.received(msg);
+            passMessageUp(copy, null, false, multicast, false);
         }
 
-        if(loopback_separate_thread) {
+       /* if(loopback_separate_thread) {
             if(loop_back)
                 loopback(msg, multicast);
             if(do_send)
@@ -1094,7 +1101,8 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
                 _send(msg, dest);
             if(loop_back)
                 loopback(msg, multicast);
-        }
+        }*/
+        _send(msg, dest);
         return null;
     }
 
@@ -1164,7 +1172,7 @@ public abstract class TP extends Protocol implements DiagnosticsHandler.ProbeHan
             return;
         }
         // changed to fix https://issues.redhat.com/browse/JGRP-506
-        msg_processing_policy.loopback(msg, msg.isFlagSet(Message.Flag.OOB));
+        msg_processing_policy.loopback(copy, msg.isFlagSet(Message.Flag.OOB));
     }
 
     protected void _send(Message msg, Address dest) {

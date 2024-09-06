@@ -8,18 +8,20 @@ import org.jgroups.annotations.ManagedAttribute;
 import org.jgroups.annotations.Property;
 import org.jgroups.conf.AttributeType;
 import org.jgroups.logging.Log;
+import org.jgroups.stack.MessageProcessingPolicy;
 import org.jgroups.util.AverageMinMax;
 import org.jgroups.util.ByteArrayDataOutputStream;
+import org.jgroups.util.MessageBatch;
 import org.jgroups.util.Util;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
+import static org.jgroups.Message.TransientFlag.DONT_LOOPBACK;
 import static org.jgroups.protocols.TP.MSG_OVERHEAD;
+import static org.jgroups.util.MessageBatch.Mode.OOB;
+import static org.jgroups.util.MessageBatch.Mode.REG;
 
 /**
  * Implements storing of messages in a hashmap and sending of single messages and message batches. Most bundler
@@ -31,6 +33,7 @@ public abstract class BaseBundler implements Bundler {
     /** Keys are destinations, values are lists of Messages */
     protected final Map<Address,List<Message>>  msgs=new HashMap<>(24);
     protected TP                                transport;
+    protected MessageProcessingPolicy           msg_processing_policy;
     protected final ReentrantLock               lock=new ReentrantLock();
     protected @GuardedBy("lock") long           count;    // current number of bytes accumulated
     protected ByteArrayDataOutputStream         output;
@@ -48,18 +51,23 @@ public abstract class BaseBundler implements Bundler {
       type=AttributeType.SCALAR)
     protected int                               capacity=16384;
 
+    @Property(description="Whether loopback messages (dest == src or dest == null) are processed")
+    protected boolean                           process_loopbacks=true;
+
     @ManagedAttribute(description="Time (us) to send the bundled messages")
     protected final AverageMinMax               avg_send_time=new AverageMinMax().unit(TimeUnit.NANOSECONDS);
 
 
-
-    public int     getCapacity()       {return capacity;}
-    public Bundler setCapacity(int c)  {this.capacity=c; return this;}
-    public int     getMaxSize()        {return max_size;}
-    public Bundler setMaxSize(int s)   {max_size=s; return this;}
+    public int     getCapacity()               {return capacity;}
+    public Bundler setCapacity(int c)          {this.capacity=c; return this;}
+    public int     getMaxSize()                {return max_size;}
+    public Bundler setMaxSize(int s)           {max_size=s; return this;}
+    public boolean processLoopbacks()          {return process_loopbacks;}
+    public Bundler processLoopbacks(boolean b) {process_loopbacks=b; return this;}
 
     public void init(TP transport) {
         this.transport=transport;
+        msg_processing_policy=transport.msgProcessingPolicy();
         log=transport.getLog();
         output=new ByteArrayDataOutputStream(max_size + MSG_OVERHEAD);
     }
@@ -104,12 +112,22 @@ public abstract class BaseBundler implements Bundler {
             List<Message> list=entry.getValue();
             if(list.isEmpty())
                 continue;
+            Address dst=entry.getKey();
+            boolean loopback=(dst == null) || Objects.equals(transport.getAddress(), dst);
             output.position(0);
-            if(list.size() == 1)
-                sendSingleMessage(list.get(0));
+
+            // System.out.printf("-- sending %d msgs to %s\n", list.size(), dst);
+
+            if(list.size() == 1) {
+                Message msg=list.get(0);
+                sendSingleMessage(msg);
+                if(process_loopbacks && loopback && !msg.isFlagSet(DONT_LOOPBACK) && transport.loopbackSeparateThread())
+                    transport.loopback(msg, msg.isFlagSet(Message.Flag.OOB));
+            }
             else {
-                Address dst=entry.getKey();
                 sendMessageList(dst, list.get(0).getSrc(), list);
+                if(process_loopbacks && loopback && transport.loopbackSeparateThread())
+                    loopback(dst, transport.getAddress(), list);
             }
             list.clear();
         }
@@ -120,6 +138,30 @@ public abstract class BaseBundler implements Bundler {
         }
     }
 
+    protected void loopback(Address dest, Address sender, List<Message> list) {
+
+
+
+        // TODO: reuse message batches, similar to ReliableMulticast.removeAndDeliver()
+
+        // TODO: implement loopback in other Bundlers (not extending this one), too
+
+
+        MessageBatch oob=new MessageBatch(dest, sender, transport.getClusterNameAscii(), dest == null, OOB, list.size());
+        MessageBatch reg=new MessageBatch(dest, sender, transport.getClusterNameAscii(), dest == null, REG, list.size());
+        for(Message msg: list) {
+            if(msg.isFlagSet(DONT_LOOPBACK))
+                continue;
+            if(msg.isFlagSet(Message.Flag.OOB))
+                oob.add(msg);
+            else
+                reg.add(msg);
+        }
+        if(!reg.isEmpty())
+            msg_processing_policy.loopback(reg, false);
+        if(!oob.isEmpty())
+            msg_processing_policy.loopback(oob, true);
+    }
 
     protected void sendSingleMessage(final Message msg) {
         Address dest=msg.getDest();

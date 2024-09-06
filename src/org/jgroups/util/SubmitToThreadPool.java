@@ -31,6 +31,15 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
         return tp.getThreadPool().execute(new SingleLoopbackHandler(msg));
     }
 
+    public boolean loopback(MessageBatch batch, boolean oob) {
+        if(oob) {
+            boolean removed=removeAndDispatchNonBundledMessages(batch);
+            if(removed && batch.isEmpty())
+                return true;
+        }
+        return tp.getThreadPool().execute(new BatchHandler(batch, true));
+    }
+
     public boolean process(Message msg, boolean oob) {
         return tp.getThreadPool().execute(new SingleMessageHandler(msg));
     }
@@ -41,7 +50,7 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
             if(removed && batch.isEmpty())
                 return true;
         }
-        return tp.getThreadPool().execute(new BatchHandler(batch));
+        return tp.getThreadPool().execute(new BatchHandler(batch, false));
     }
 
 
@@ -120,9 +129,11 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
 
     public class BatchHandler implements Runnable {
         protected MessageBatch batch;
+        protected boolean      loopback;
 
-        public BatchHandler(final MessageBatch batch) {
+        public BatchHandler(final MessageBatch batch, boolean loopback) {
             this.batch=batch;
+            this.loopback=loopback;
         }
 
         public MessageBatch getBatch() {return batch;}
@@ -134,7 +145,7 @@ public class SubmitToThreadPool implements MessageProcessingPolicy {
         }
 
         protected void passBatchUp() {
-            tp.passBatchUp(batch, true, true);
+            tp.passBatchUp(batch, !loopback, !loopback);
         }
     }
 
